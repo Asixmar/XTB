@@ -29,6 +29,7 @@ NEWS_PER_TICKER = 2         # ile newsów na spółkę w tygodniowym briefie
 NEWS_MAX_AGE_DAYS = 8       # newsy starsze niż tyle dni pomijamy
 STATE_FILE = "alert_state.json"
 HOLDINGS_FILE = "holdings.csv"
+GEMINI_MODEL = "gemini-2.5-flash"   # stabilny i w darmowym limicie; nowszy: gemini-3.6-flash, najtańszy: gemini-3.5-flash-lite
 
 # --------------------------------------------------------------
 
@@ -153,27 +154,95 @@ def recent_news(ticker):
 
 # ------------------------- TRYBY -------------------------
 
+def ai_digest_pl(items):
+    """Buduje polski przegląd z wyjaśnieniami przez Gemini API. Zwraca tekst albo None."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return None  # brak klucza -> awaryjnie użyjemy nagłówków po angielsku
+
+    blocks = []
+    for it in items:
+        if it["wk"] is None:
+            hdr = f"{it['name']} | (brak danych o zmianie) (tydz.)"
+        else:
+            emoji = "🟢" if it["wk"] >= 0 else "🔴"
+            hdr = f"{it['name']} | {emoji} {it['wk']:+.1f}% (tydz.)"
+        news = "\n".join(f"- {h}" for h in it["headlines"]) or "- (brak newsów)"
+        blocks.append(hdr + "\n" + news)
+    data = "\n\n".join(blocks)
+
+    system = (
+        "Jesteś asystentem, który objaśnia newsy giełdowe początkującemu inwestorowi. "
+        "Piszesz wyłącznie po polsku, prosto, zwięźle, bez żargonu. "
+        "Nie doradzasz kupna ani sprzedaży — tylko wyjaśniasz."
+    )
+    prompt = (
+        "Dostajesz spółki z portfela, ich tygodniową zmianę ceny i nagłówki newsów po angielsku.\n"
+        "Zwróć przegląd PO POLSKU. Dla każdej spółki użyj DOKŁADNIE podanego nagłówka z emoji i liczbą "
+        "(nie zmieniaj liczb ani nazw), a pod nim dla każdego newsa dwie linie:\n"
+        "• <krótka polska parafraza nagłówka>\n"
+        "   ↳ <1-2 zdania: co ta wiadomość oznacza i jak MOŻE wpłynąć na wycenę akcji, prosto dla laika>\n"
+        "Jeśli spółka nie ma newsów, wpisz tylko: • brak świeżych newsów\n"
+        "Nie dodawaj żadnego wstępu, tytułu ani podsumowania na końcu.\n\n"
+        f"Dane:\n{data}"
+    )
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 1600, "temperature": 0.4},
+            },
+            timeout=60,
+        )
+        if r.status_code != 200:
+            print("Gemini API:", r.status_code, r.text[:200])
+            return None
+        cand = r.json().get("candidates", [])
+        if not cand:
+            print("Gemini: brak odpowiedzi (możliwa blokada treści)")
+            return None
+        parts = cand[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return text or None
+    except Exception as e:
+        print("Gemini błąd:", e)
+        return None
+
+
 def run_weekly(holdings):
-    lines = []
+    items = []
     for h in holdings:
-        t = h["ticker"]
-        closes = price_history(t)
-        wk = pct_change(closes, 5)
-        head = h["name"]
-        if wk is not None:
-            arrow = "🟢" if wk >= 0 else "🔴"
-            head += f"  {arrow} {wk:+.1f}% (tydz.)"
+        closes = price_history(h["ticker"])
+        items.append({
+            "name": h["name"],
+            "wk": pct_change(closes, 5),
+            "headlines": [n["title"] for n in recent_news(h["ticker"])],
+        })
+
+    today = dt.date.today().strftime("%d.%m")
+
+    ai = ai_digest_pl(items)
+    if ai:
+        lines = ai.splitlines() + ["", "ℹ️ To nie porada inwestycyjna — tylko wyjaśnienie newsów."]
+        send_long(f"📊 Przegląd portfela {today}", lines)
+        return
+
+    # AWARYJNIE (brak GEMINI_API_KEY lub błąd API): stary format z nagłówkami po angielsku
+    lines = []
+    for it in items:
+        head = it["name"]
+        if it["wk"] is not None:
+            head += f"  {'🟢' if it['wk'] >= 0 else '🔴'} {it['wk']:+.1f}% (tydz.)"
         lines.append(head)
-        news = recent_news(t)
-        if news:
-            for n in news:
-                lines.append(f"  • {n['title']}")
+        if it["headlines"]:
+            for t in it["headlines"]:
+                lines.append(f"  • {t}")
         else:
             lines.append("  • brak świeżych newsów")
         lines.append("")
-    if not lines:
-        return
-    today = dt.date.today().strftime("%d.%m")
     send_long(f"📊 Przegląd portfela {today}", lines)
 
 
