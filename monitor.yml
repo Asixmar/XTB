@@ -1,0 +1,56 @@
+name: Portfel monitor
+
+on:
+  schedule:
+    # Alert: w dni robocze o 22:00 UTC (po zamknięciu giełdy USA)
+    - cron: "0 22 * * 1-5"
+    # Tygodniowy brief: poniedziałek 07:00 UTC (~09:00 w Polsce)
+    - cron: "0 7 * * 1"
+  workflow_dispatch:      # pozwala odpalić ręcznie z zakładki Actions
+    inputs:
+      mode:
+        description: "Tryb (alert / weekly)"
+        default: "weekly"
+
+permissions:
+  contents: write         # potrzebne, by zapisać alert_state.json
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Ustal tryb
+        id: mode
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 7 * * 1" ]; then
+            echo "mode=weekly" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.inputs.mode }}" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            echo "mode=alert" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Uruchom monitor
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Zapisz stan alertów
+        run: |
+          if [ -n "$(git status --porcelain alert_state.json)" ]; then
+            git config user.name "portfel-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add alert_state.json
+            git commit -m "update alert state"
+            git push
+          fi
