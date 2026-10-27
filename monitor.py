@@ -1,309 +1,428 @@
-#!/usr/bin/env python3
 """
-Portfel IKE — monitor.
-Dwa tryby (ustawiane zmienną środowiskową MODE):
-  MODE=weekly  -> raz w tygodniu: brief z najważniejszymi newsami + tygodniowa zmiana ceny
-  MODE=alert   -> codziennie: sprawdza ruch ceny i przy zmianie >= PROGU wysyła push
+Miesięczny raport portfela -> Telegram
+=======================================
 
-Powiadomienia: domyślnie Telegram (bot wysyła wiadomość jak czat -> push na iPhone jak SMS).
-Alternatywy (Pushover / ntfy) są niżej, w funkcji notify() — wystarczy odkomentować.
+Raz w miesiącu dla każdej spółki z holdings.csv:
+  1. Kurs: zmiana w ostatnim miesiącu, 3 największe dzienne ruchy, 52-tyg. max/min.
+  2. Newsy z największych serwisów finansowych (Bloomberg, WSJ, Reuters, FT, CNBC,
+     MarketWatch, Barron's, Yahoo Finance) — przez kanały RSS (Google News + Yahoo).
+  3. Analitycy: konsensus, średnia cena docelowa, ostatnie podwyżki/obniżki rekomendacji
+     (z zaznaczeniem największych banków: Goldman, Morgan Stanley, JPMorgan itd.).
+  4. AI (Claude) wybiera newsy, które najmocniej mogą ruszyć ceną, i streszcza,
+     co sądzą analitycy — po polsku.
+  5. Wysyła wszystko na Telegram.
 
-Uruchamiane automatycznie przez GitHub Actions (patrz .github/workflows/monitor.yml).
+Sekrety (GitHub -> Settings -> Secrets -> Actions):
+  TG_BOT_TOKEN, TG_CHAT_ID   – bot Telegrama (wymagane)
+  ANTHROPIC_API_KEY          – klucz do Claude (zalecane; bez niego raport bez streszczeń AI)
+
+Test lokalny bez wysyłania:  DRY_RUN=1 python monitor.py
 """
 
-import os
 import csv
-import json
-import sys
 import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+from urllib.parse import quote_plus
 
+import feedparser
+import pandas as pd
 import requests
 import yfinance as yf
 
-# ------------------------- USTAWIENIA -------------------------
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "31"))     # okres newsów i zmiany kursu
+ANALYST_DAYS = int(os.environ.get("ANALYST_DAYS", "90"))       # okres zmian rekomendacji
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+DRY_RUN = os.environ.get("DRY_RUN") == "1"
+REPORT_FILE = "report.txt"
 
-THRESHOLD_PCT = 20.0        # próg alertu (%). Zmień na 15 / 10 jeśli chcesz częściej.
-LOOKBACKS = [1, 5]          # okna do sprawdzania ruchu: 1 sesja i ~1 tydzień (5 sesji)
-SUPPRESS_DAYS = 3           # nie powtarzaj tego samego alertu dla spółki przez X dni
-NEWS_PER_TICKER = 2         # ile newsów na spółkę w tygodniowym briefie
-NEWS_MAX_AGE_DAYS = 8       # newsy starsze niż tyle dni pomijamy
-STATE_FILE = "alert_state.json"
-HOLDINGS_FILE = "holdings.csv"
-GEMINI_MODEL = "gemini-2.5-flash"   # stabilny i w darmowym limicie; nowszy: gemini-3.6-flash, najtańszy: gemini-3.5-flash-lite
+# Serwisy, z których bierzemy newsy (domena -> nazwa wyświetlana)
+SOURCES = {
+    "bloomberg.com": "Bloomberg",
+    "wsj.com": "Wall Street Journal",
+    "reuters.com": "Reuters",
+    "ft.com": "Financial Times",
+    "cnbc.com": "CNBC",
+    "marketwatch.com": "MarketWatch",
+    "barrons.com": "Barron's",
+    "finance.yahoo.com": "Yahoo Finance",
+}
 
-# --------------------------------------------------------------
+# Największe domy maklerskie / banki inwestycyjne — ich zmiany rekomendacji są wyróżniane
+TOP_FIRMS = [
+    "goldman", "morgan stanley", "jp morgan", "jpmorgan", "bank of america", "bofa",
+    "citi", "ubs", "barclays", "wells fargo", "deutsche", "jefferies", "evercore",
+    "bernstein", "rbc", "bmo", "hsbc", "td cowen", "cowen", "piper sandler",
+    "raymond james", "wedbush", "oppenheimer", "mizuho", "baird", "truist",
+    "needham", "keybanc", "stifel", "cantor", "bnp", "societe generale", "macquarie",
+]
+
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 
-def load_holdings():
-    """Wczytuje holdings.csv: kolumny ticker,name (name opcjonalne)."""
+# ---------------------------------------------------------------- pomocnicze
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def retry(label, fn, tries=3, wait=4):
+    """Wywołuje fn() z ponowieniem — Yahoo potrafi chwilowo odrzucać zapytania z GitHuba."""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"   ! {label} (próba {i + 1}/{tries}): {e}")
+            if i < tries - 1:
+                time.sleep(wait * (i + 1))
+    return None
+
+
+def num(x, nd=2):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(v):
+        return None
+    return round(v, nd)
+
+
+def is_top_firm(name):
+    n = (name or "").lower()
+    return any(f in n for f in TOP_FIRMS)
+
+
+def norm_title(t):
+    return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+
+def load_holdings(path="holdings.csv"):
     rows = []
-    with open(HOLDINGS_FILE, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             t = (r.get("ticker") or "").strip()
             if not t:
                 continue
-            rows.append({"ticker": t, "name": (r.get("name") or t).strip()})
+            rows.append({
+                "ticker": t,
+                "name": (r.get("name") or t).strip(),
+                "query": (r.get("query") or "").strip(),
+                "type": (r.get("type") or "stock").strip().lower(),
+            })
     if not rows:
-        print("Brak spółek w holdings.csv"); sys.exit(0)
+        sys.exit("!! holdings.csv jest pusty albo ma złe nagłówki (wymagane: ticker,name).")
     return rows
 
 
-# ------------------------- POWIADOMIENIA -------------------------
-
-def notify(title, message, url=None):
-    """Wysyła wiadomość. Domyślnie Telegram (bot -> czat na Twoim telefonie)."""
-    bot = os.environ.get("TG_BOT_TOKEN")
-    chat = os.environ.get("TG_CHAT_ID")
-    if not bot or not chat:
-        print("!! Brak TG_BOT_TOKEN / TG_CHAT_ID — ustaw sekrety w GitHub.")
-        print(f"[DRY RUN] {title}\n{message}")
-        return
-    text = f"{title}\n\n{message}"
-    if url:
-        text += f"\n{url}"
-    r = requests.post(
-        f"https://api.telegram.org/bot{bot}/sendMessage",
-        data={"chat_id": chat, "text": text, "disable_web_page_preview": True},
-        timeout=20,
-    )
-    print("Telegram:", r.status_code, r.text[:120])
-
-    # --- Pushover (odkomentuj, jeśli wolisz zamiast Telegrama) ---
-    # data = {"token": os.environ["PUSHOVER_TOKEN"], "user": os.environ["PUSHOVER_USER"],
-    #         "title": title, "message": message}
-    # if url: data["url"] = url
-    # requests.post("https://api.pushover.net/1/messages.json", data=data, timeout=20)
-
-    # --- ntfy (odkomentuj, jeśli wolisz zamiast Telegrama) ---
-    # topic = os.environ["NTFY_TOPIC"]  # np. "moj-portfel-xyz123"
-    # requests.post(f"https://ntfy.sh/{topic}", data=message.encode("utf-8"),
-    #               headers={"Title": title, "Click": url or ""}, timeout=20)
-
-
-def send_long(title, lines, url=None):
-    """Dzieli długi brief na kilka wiadomości (limit Telegrama to 4096 znaków)."""
-    chunk, size, part = [], 0, 1
-    for ln in lines:
-        if size + len(ln) > 3500 and chunk:
-            notify(f"{title} ({part})", "\n".join(chunk), url)
-            chunk, size, part = [], 0, part + 1
-        chunk.append(ln); size += len(ln) + 1
-    if chunk:
-        suffix = f" ({part})" if part > 1 else ""
-        notify(f"{title}{suffix}", "\n".join(chunk), url)
-
-
-# ------------------------- DANE -------------------------
-
-def price_history(ticker):
-    """Zwraca listę dziennych zamknięć (najstarsze -> najnowsze) lub []."""
-    try:
-        h = yf.Ticker(ticker).history(period="1mo", interval="1d")
-        closes = [float(x) for x in h["Close"].dropna().tolist()]
-        return closes
-    except Exception as e:
-        print(f"  cena {ticker}: błąd {e}")
-        return []
-
-
-def pct_change(closes, lookback):
-    if len(closes) <= lookback:
+# ---------------------------------------------------------------- kurs
+def price_stats(tk):
+    h = retry("historia kursu", lambda: tk.history(period="1y", auto_adjust=False))
+    if h is None or h.empty:
         return None
-    old, new = closes[-1 - lookback], closes[-1]
-    if not old:
-        return None
-    return (new - old) / old * 100.0
+    close = h["Close"].dropna()
+    last = float(close.iloc[-1])
+    cutoff = close.index[-1] - pd.Timedelta(days=LOOKBACK_DAYS)
+    before = close[close.index <= cutoff]
+    start = float(before.iloc[-1]) if len(before) else float(close.iloc[0])
 
+    rets = close.pct_change().dropna()
+    rets = rets[rets.index > cutoff]
+    biggest = rets.abs().sort_values(ascending=False).head(3).index
+    moves = [{"data": str(d.date()), "zmiana_%": round(float(rets[d]) * 100, 2)}
+             for d in sorted(biggest)]
 
-def recent_news(ticker):
-    """Defensywnie wyciąga newsy (schemat yfinance bywa różny w wersjach)."""
+    currency = None
     try:
-        items = yf.Ticker(ticker).news or []
-    except Exception:
-        return []
-    out = []
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=NEWS_MAX_AGE_DAYS)
-    for it in items:
-        c = it.get("content", it)  # nowszy yfinance zagnieżdża w "content"
-        title = c.get("title") or it.get("title")
+        currency = tk.fast_info.get("currency")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "kurs": round(last, 2),
+        "waluta": currency,
+        "zmiana_miesiac_%": round((last / start - 1) * 100, 2),
+        "max_52t": round(float(close.max()), 2),
+        "min_52t": round(float(close.min()), 2),
+        "najwieksze_ruchy_dzienne": moves,
+    }
+
+
+# ---------------------------------------------------------------- newsy
+def fetch_feed(url):
+    r = requests.get(url, headers=UA, timeout=25)
+    r.raise_for_status()
+    return feedparser.parse(r.content).entries
+
+
+def entry_time(e):
+    for k in ("published_parsed", "updated_parsed"):
+        if e.get(k):
+            return dt.datetime(*e[k][:6], tzinfo=dt.timezone.utc)
+    return None
+
+
+def google_news(term):
+    sites = " OR ".join(f"site:{d}" for d in SOURCES)
+    q = f"({term}) ({sites}) when:{LOOKBACK_DAYS}d"
+    url = ("https://news.google.com/rss/search?q=" + quote_plus(q)
+           + "&hl=en-US&gl=US&ceid=US:en")
+    items = []
+    for e in retry("Google News RSS", lambda: fetch_feed(url)) or []:
+        src = (e.get("source") or {}).get("title") or ""
+        title = e.get("title", "")
+        if src and title.endswith(" - " + src):
+            title = title[: -len(" - " + src)]
+        items.append({"tytul": title, "zrodlo": src or "?", "link": e.get("link"),
+                      "czas": entry_time(e)})
+    return items
+
+
+def yahoo_rss(ticker):
+    url = (f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(ticker)}"
+           "&region=US&lang=en-US")
+    items = []
+    for e in retry("Yahoo RSS", lambda: fetch_feed(url)) or []:
+        items.append({"tytul": e.get("title", ""), "zrodlo": "Yahoo Finance",
+                      "link": e.get("link"), "czas": entry_time(e),
+                      "opis": re.sub("<[^>]+>", "", e.get("summary", ""))[:300]})
+    return items
+
+
+def yfinance_news(tk):
+    items = []
+    for n in retry("yfinance news", lambda: tk.news) or []:
+        c = n.get("content") or n          # nowy i stary format yfinance
+        title = c.get("title")
         if not title:
             continue
-        # data publikacji (różne pola)
-        ts = it.get("providerPublishTime")
         when = None
-        if ts:
-            when = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
-        else:
-            pd = c.get("pubDate") or c.get("displayTime")
-            if pd:
-                try:
-                    when = dt.datetime.fromisoformat(pd.replace("Z", "+00:00"))
-                except Exception:
-                    when = None
-        if when and when < cutoff:
+        if c.get("pubDate"):
+            when = pd.to_datetime(c["pubDate"], utc=True).to_pydatetime()
+        elif n.get("providerPublishTime"):
+            when = dt.datetime.fromtimestamp(n["providerPublishTime"], dt.timezone.utc)
+        provider = (c.get("provider") or {}).get("displayName") or n.get("publisher") or "Yahoo Finance"
+        link = (c.get("canonicalUrl") or {}).get("url") or n.get("link")
+        items.append({"tytul": title, "zrodlo": provider, "link": link, "czas": when,
+                      "opis": (c.get("summary") or "")[:300]})
+    return items
+
+
+def collect_news(h, tk):
+    term = h["query"] or f'"{h["name"]}"'
+    raw = google_news(term) + yahoo_rss(h["ticker"]) + yfinance_news(tk)
+    cutoff = now_utc() - dt.timedelta(days=LOOKBACK_DAYS)
+    seen, out = set(), []
+    for it in raw:
+        if not it["tytul"] or (it["czas"] and it["czas"] < cutoff):
             continue
-        link = ""
-        if isinstance(c.get("canonicalUrl"), dict):
-            link = c["canonicalUrl"].get("url", "")
-        link = link or it.get("link") or ""
-        out.append({"title": title.strip(), "link": link})
-        if len(out) >= NEWS_PER_TICKER:
-            break
+        key = norm_title(it["tytul"])[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    out.sort(key=lambda x: x["czas"] or cutoff, reverse=True)
+    for it in out:
+        it["czas"] = it["czas"].strftime("%Y-%m-%d") if it["czas"] else None
+    return out[:45]
+
+
+# ---------------------------------------------------------------- analitycy
+ACTION_PL = {"up": "podwyższenie", "down": "obniżenie", "init": "rozpoczęcie wyceny",
+             "main": "podtrzymanie", "reit": "powtórzenie"}
+
+
+def analyst_data(tk, last_price):
+    out = {}
+    info = retry("info", lambda: tk.info) or {}
+    out["konsensus"] = info.get("recommendationKey")
+    out["konsensus_srednia_1do5"] = num(info.get("recommendationMean"))  # 1 = strong buy, 5 = sell
+    out["liczba_analitykow"] = info.get("numberOfAnalystOpinions")
+
+    pt = retry("ceny docelowe", lambda: tk.analyst_price_targets) or {}
+    if pt:
+        mean = num(pt.get("mean"))
+        out["cena_docelowa"] = {"srednia": mean, "mediana": num(pt.get("median")),
+                                "min": num(pt.get("low")), "max": num(pt.get("high"))}
+        if mean and last_price:
+            out["potencjal_do_sredniej_%"] = round((mean / last_price - 1) * 100, 1)
+
+    rs = retry("rekomendacje", lambda: tk.recommendations_summary)
+    if rs is not None and not rs.empty:
+        out["rozklad_rekomendacji"] = rs.head(2).to_dict(orient="records")  # teraz i miesiąc temu
+
+    ud = retry("zmiany rekomendacji", lambda: tk.upgrades_downgrades)
+    actions = []
+    if ud is not None and not ud.empty:
+        df = ud.copy()
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = df[df.index >= now_utc() - dt.timedelta(days=ANALYST_DAYS)].sort_index(ascending=False)
+        for d, r in df.iterrows():
+            firm = str(r.get("Firm", ""))
+            actions.append({
+                "data": str(d.date()), "firma": firm, "duzy_bank": is_top_firm(firm),
+                "akcja": ACTION_PL.get(str(r.get("Action", "")), r.get("Action")),
+                "z": r.get("FromGrade") or None, "na": r.get("ToGrade") or None,
+                "cena_docelowa": num(r.get("currentPriceTarget")) or None,
+                "poprzednia_cena_docelowa": num(r.get("priorPriceTarget")) or None,
+            })
+    # najpierw duże banki, potem reszta; max 25 pozycji
+    actions.sort(key=lambda a: (not a["duzy_bank"], a["data"]), reverse=False)
+    top = [a for a in actions if a["duzy_bank"]]
+    rest = [a for a in actions if not a["duzy_bank"]]
+    out["ostatnie_zmiany"] = (sorted(top, key=lambda a: a["data"], reverse=True)
+                              + sorted(rest, key=lambda a: a["data"], reverse=True))[:25]
     return out
 
 
-# ------------------------- TRYBY -------------------------
+# ---------------------------------------------------------------- AI
+SYSTEM = """Jesteś analitykiem rynku kapitałowego piszącym miesięczny raport dla inwestora
+indywidualnego z Polski. Piszesz po polsku, konkretnie, bez lania wody.
+Zasady:
+- Korzystasz WYŁĄCZNIE z danych podanych w wiadomości. Niczego nie dopisujesz z pamięci.
+  Jeśli czegoś brakuje — napisz krótko, że brak danych.
+- Z listy newsów wybierasz te, które realnie mogą najmocniej wpłynąć na cenę
+  (wyniki i prognozy, duże kontrakty, regulacje, przejęcia, zmiany w zarządzie,
+  pozwy, zmiany rekomendacji, makro: Fed, inflacja). Pomijasz szum i powtórki.
+- Gdy największy dzienny ruch kursu zbiega się datą z newsem — połącz je.
+- Przy każdym newsie podaj źródło (np. Bloomberg, Reuters) i datę.
+- Nie dajesz własnych rekomendacji kup/sprzedaj — relacjonujesz, co sądzą analitycy.
+- Format: zwykły tekst pod Telegram, BEZ markdown (żadnych **, #, tabel). Możesz używać emoji
+  jako nagłówków i myślników jako punktów. Maksymalnie ok. 2500 znaków."""
 
-def ai_digest_pl(items):
-    """Buduje polski przegląd z wyjaśnieniami przez Gemini API. Zwraca tekst albo None."""
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        return None  # brak klucza -> awaryjnie użyjemy nagłówków po angielsku
+TEMPLATE = """Spółka/instrument: {name} ({ticker}), typ: {type}
 
-    blocks = []
-    for it in items:
-        if it["wk"] is None:
-            hdr = f"{it['name']} | (brak danych o zmianie) (tydz.)"
-        else:
-            emoji = "🟢" if it["wk"] >= 0 else "🔴"
-            hdr = f"{it['name']} | {emoji} {it['wk']:+.1f}% (tydz.)"
-        news = "\n".join(f"- {h}" for h in it["headlines"]) or "- (brak newsów)"
-        blocks.append(hdr + "\n" + news)
-    data = "\n\n".join(blocks)
+DANE (JSON):
+{data}
 
-    system = (
-        "Jesteś asystentem, który objaśnia newsy giełdowe początkującemu inwestorowi. "
-        "Piszesz wyłącznie po polsku, prosto, zwięźle, bez żargonu. "
-        "Nie doradzasz kupna ani sprzedaży — tylko wyjaśniasz."
+Napisz sekcję raportu w tym układzie:
+📌 {name} ({ticker})
+1) Jednym zdaniem: co było najważniejsze w tym miesiącu i jak zachował się kurs.
+2) 📰 Najważniejsze newsy (3–5, od najsilniejszego wpływu na cenę): tytuł po polsku,
+   źródło, data, 1 zdanie dlaczego to ważne i w którą stronę może ruszyć cenę (↑/↓/?).
+   Pod 3 najważniejszymi wklej ich link w osobnej linii.
+3) 🏦 Analitycy: konsensus, średnia cena docelowa i potencjał względem kursu,
+   najważniejsze ostatnie zmiany (szczególnie duże banki — nazwa firmy, z czego na co,
+   nowa cena docelowa), czy nastroje się poprawiają czy pogarszają.
+   Dla ETF-u zamiast tego: co analitycy i media mówią o całym rynku/indeksie.
+4) ⚖️ Bilans: główne szanse i główne ryzyka na najbliższe tygodnie (po 1–2)."""
+
+
+def ai_section(h, data):
+    import anthropic
+    client = anthropic.Anthropic()
+    payload = json.dumps(data, ensure_ascii=False, default=str, indent=1)
+    msg = client.messages.create(
+        model=MODEL, max_tokens=3000, system=SYSTEM,
+        messages=[{"role": "user", "content": TEMPLATE.format(
+            name=h["name"], ticker=h["ticker"], type=h["type"], data=payload)}],
     )
-    prompt = (
-        "Dostajesz spółki z portfela, ich tygodniową zmianę ceny i nagłówki newsów po angielsku.\n"
-        "Zwróć przegląd PO POLSKU. Dla każdej spółki użyj DOKŁADNIE podanego nagłówka z emoji i liczbą "
-        "(nie zmieniaj liczb ani nazw), a pod nim dla każdego newsa dwie linie:\n"
-        "• <krótka polska parafraza nagłówka>\n"
-        "   ↳ <1-2 zdania: co ta wiadomość oznacza i jak MOŻE wpłynąć na wycenę akcji, prosto dla laika>\n"
-        "Jeśli spółka nie ma newsów, wpisz tylko: • brak świeżych newsów\n"
-        "Nie dodawaj żadnego wstępu, tytułu ani podsumowania na końcu.\n\n"
-        f"Dane:\n{data}"
-    )
-    try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-            json={
-                "system_instruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 1600, "temperature": 0.4},
-            },
-            timeout=60,
-        )
-        if r.status_code != 200:
-            print("Gemini API:", r.status_code, r.text[:200])
-            return None
-        cand = r.json().get("candidates", [])
-        if not cand:
-            print("Gemini: brak odpowiedzi (możliwa blokada treści)")
-            return None
-        parts = cand[0].get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts).strip()
-        return text or None
-    except Exception as e:
-        print("Gemini błąd:", e)
-        return None
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
 
 
-def run_weekly(holdings):
-    items = []
-    for h in holdings:
-        closes = price_history(h["ticker"])
-        items.append({
-            "name": h["name"],
-            "wk": pct_change(closes, 5),
-            "headlines": [n["title"] for n in recent_news(h["ticker"])],
-        })
+def plain_section(h, data):
+    """Wersja bez AI (gdy brak ANTHROPIC_API_KEY albo błąd API)."""
+    p, a = data.get("kurs") or {}, data.get("analitycy") or {}
+    lines = [f"📌 {h['name']} ({h['ticker']})"]
+    if p:
+        lines.append(f"Kurs {p['kurs']} {p.get('waluta') or ''} | miesiąc {p['zmiana_miesiac_%']:+.1f}%")
+    big = [n for n in data.get("newsy", []) if n["zrodlo"] != "Yahoo Finance"][:5] \
+        or data.get("newsy", [])[:5]
+    if big:
+        lines.append("📰 Newsy:")
+        lines += [f"- {n['tytul']} ({n['zrodlo']}, {n['czas']})" for n in big]
+    if a.get("konsensus"):
+        cd = a.get("cena_docelowa") or {}
+        lines.append(f"🏦 Konsensus: {a['konsensus']} ({a.get('liczba_analitykow')} analityków), "
+                     f"śr. cena docelowa {cd.get('srednia')} ({a.get('potencjal_do_sredniej_%')}%)")
+    for z in a.get("ostatnie_zmiany", [])[:5]:
+        lines.append(f"- {z['data']} {z['firma']}: {z['akcja']} {z['z'] or ''}→{z['na'] or ''}"
+                     + (f", PT {z['cena_docelowa']}" if z['cena_docelowa'] else ""))
+    return "\n".join(lines)
 
-    today = dt.date.today().strftime("%d.%m")
 
-    ai = ai_digest_pl(items)
-    if ai:
-        lines = ai.splitlines() + ["", "ℹ️ To nie porada inwestycyjna — tylko wyjaśnienie newsów."]
-        send_long(f"📊 Przegląd portfela {today}", lines)
+# ---------------------------------------------------------------- Telegram
+def split_message(text, limit=3800):
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > limit and cur:
+            parts.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def send(text):
+    token, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
+    with open(REPORT_FILE, "a", encoding="utf-8") as f:
+        f.write(text + "\n\n" + "-" * 40 + "\n\n")
+    if DRY_RUN:
+        print("[DRY RUN]\n" + text + "\n")
         return
-
-    # AWARYJNIE (brak GEMINI_API_KEY lub błąd API): stary format z nagłówkami po angielsku
-    lines = []
-    for it in items:
-        head = it["name"]
-        if it["wk"] is not None:
-            head += f"  {'🟢' if it['wk'] >= 0 else '🔴'} {it['wk']:+.1f}% (tydz.)"
-        lines.append(head)
-        if it["headlines"]:
-            for t in it["headlines"]:
-                lines.append(f"  • {t}")
-        else:
-            lines.append("  • brak świeżych newsów")
-        lines.append("")
-    send_long(f"📊 Przegląd portfela {today}", lines)
+    if not token or not chat:
+        sys.exit("!! Brak TG_BOT_TOKEN / TG_CHAT_ID — dodaj sekrety w GitHub.")
+    for part in split_message(text):
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": part,
+                                "disable_web_page_preview": True}, timeout=30)
+        print("Telegram:", r.status_code, r.text[:200])
+        if not r.ok:   # czerwony X w Actions zamiast cichej porażki
+            sys.exit(f"!! Telegram odrzucił wiadomość: {r.status_code} {r.text[:300]}")
+        time.sleep(1)
 
 
-def run_alert(holdings):
-    state = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            state = json.load(open(STATE_FILE, encoding="utf-8"))
-        except Exception:
-            state = {}
-    today = dt.date.today().isoformat()
-    changed = False
-
-    for h in holdings:
-        t = h["ticker"]
-        closes = price_history(t)
-        if len(closes) < 2:
-            continue
-        hit = None
-        for lb in LOOKBACKS:
-            ch = pct_change(closes, lb)
-            if ch is not None and abs(ch) >= THRESHOLD_PCT:
-                # bierzemy największy ruch
-                if hit is None or abs(ch) > abs(hit[1]):
-                    hit = (lb, ch)
-        if not hit:
-            continue
-
-        # dedup: nie powtarzaj tego samego alertu przez SUPPRESS_DAYS
-        last = state.get(t, {}).get("date")
-        if last:
-            try:
-                gap = (dt.date.fromisoformat(today) - dt.date.fromisoformat(last)).days
-                if gap < SUPPRESS_DAYS:
-                    continue
-            except Exception:
-                pass
-
-        lb, ch = hit
-        window = "dziś" if lb == 1 else f"{lb} sesji"
-        arrow = "🚀" if ch >= 0 else "⚠️"
-        price = closes[-1]
-        notify(
-            f"{arrow} {h['name']}: {ch:+.1f}%",
-            f"Duży ruch ({window}). Kurs: {price:.2f}.\nSprawdź co się dzieje w {t}.",
-        )
-        state[t] = {"date": today, "pct": round(ch, 1)}
-        changed = True
-
-    if changed:
-        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
-
+# ---------------------------------------------------------------- main
 def main():
-    mode = os.environ.get("MODE", "alert").lower()
+    open(REPORT_FILE, "w").close()
     holdings = load_holdings()
-    print(f"Tryb: {mode}, spółek: {len(holdings)}")
-    if mode == "weekly":
-        run_weekly(holdings)
-    else:
-        run_alert(holdings)
+    use_ai = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if not use_ai:
+        print("!! Brak ANTHROPIC_API_KEY — raport pójdzie bez streszczeń AI.")
+
+    sections, summary_rows, ok = [], [], 0
+    for h in holdings:
+        print(f"== {h['ticker']}")
+        try:
+            tk = yf.Ticker(h["ticker"])
+            price = price_stats(tk)
+            news = collect_news(h, tk)
+            analysts = analyst_data(tk, price["kurs"] if price else None) \
+                if h["type"] != "etf" else {}
+            data = {"kurs": price, "analitycy": analysts, "newsy": news}
+            print(f"   kurs: {'ok' if price else 'BRAK'} | newsy: {len(news)} | "
+                  f"zmiany rekomendacji: {len(analysts.get('ostatnie_zmiany', []))}")
+            if price:
+                summary_rows.append(f"{h['name']}: {price['kurs']} {price.get('waluta') or ''} "
+                                    f"({price['zmiana_miesiac_%']:+.1f}% m/m)")
+            if not price and not news:
+                raise RuntimeError("brak danych z Yahoo i z newsów")
+
+            text = None
+            if use_ai:
+                text = retry("Claude API", lambda: ai_section(h, data), tries=2, wait=10)
+            sections.append(text or plain_section(h, data))
+            ok += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"   !! {h['ticker']}: {e}")
+            sections.append(f"📌 {h['name']} ({h['ticker']})\n⚠️ Nie udało się pobrać danych: {e}")
+
+    month = now_utc().strftime("%m.%Y")
+    header = (f"📊 Miesięczny raport portfela — {month}\n\n"
+              + ("\n".join(summary_rows) or "brak kursów")
+              + f"\n\nNewsy z ostatnich {LOOKBACK_DAYS} dni: Bloomberg, WSJ, Reuters, FT, CNBC, "
+                "MarketWatch, Barron's, Yahoo Finance.\n"
+                "ℹ️ Raport informacyjny, nie jest poradą inwestycyjną.")
+    send(header)
+    for s in sections:
+        send(s)
+
+    if ok == 0:
+        sys.exit("!! Nie udało się przygotować raportu dla żadnej pozycji.")
 
 
 if __name__ == "__main__":
