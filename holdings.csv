@@ -1,5 +1,15 @@
-ticker,name
-AVAV,AeroVironment
-GOOGL,Alphabet
-VRT,Vertiv
-CSPX.L,iShares Core S&P 500
+ticker,name,type,query
+CDR.WA,CD Projekt,stock,"""CD Projekt"" OR ""Cyberpunk 2"" OR ""Witcher 4"""
+PANW,Palo Alto Networks,stock,"""Palo Alto Networks"""
+TTWO,Take-Two Interactive,stock,"""Take-Two"" OR ""GTA 6"""
+GOOGL,Alphabet,stock,"""Alphabet"" OR ""Google"""
+SPCX,SpaceX,stock,"""SpaceX"""
+MP,MP Materials,stock,"""MP Materials"" OR ""rare earths"""
+VRT,Vertiv,stock,"""Vertiv"""
+AVAV,AeroVironment,stock,"""AeroVironment"""
+MU,Micron Technology,stock,"""Micron Technology"" OR ""Micron"""
+CNDX.L,iShares NASDAQ 100,etf,"""Nasdaq 100"" OR ""tech stocks"""
+EIMI.L,iShares Core MSCI EM IMI,etf,"""emerging markets"" stocks OR ""MSCI Emerging Markets"""
+CSPX.L,iShares Core S&P 500,etf,"""S&P 500"" OR ""Federal Reserve"" OR ""Wall Street stocks"""
+IUIT.L,iShares S&P 500 IT Sector,etf,"""tech stocks"" OR ""semiconductor stocks"""
+DFEN.DE,VanEck Defense,etf,"""defense stocks"" OR ""NATO spending"" OR ""defence spending"""
