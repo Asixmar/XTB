@@ -1,2 +1,5 @@
-yfinance>=0.2.40
-requests>=2.31
+yfinance>=0.2.54
+pandas
+requests
+feedparser
+anthropic
